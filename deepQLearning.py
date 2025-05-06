@@ -1,26 +1,28 @@
 import gymnasium as gym
 import numpy as np
 import pandas as pd
-from stable_baselines3 import DQN
+from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, StopTrainingOnNoModelImprovement
 
 class TradingGymEnv(gym.Env):
-    def __init__(self, data, initial_balance=1000000, trading_fee=0.001, max_steps=None):
+    def __init__(self, yearly_data, initial_balance=10000, trading_fee=0.001):
         super().__init__()
         
         # Configuración del entorno
-        self.data = data.reset_index()
+        self.yearly_data = yearly_data
+        self.years = list(yearly_data.keys())
+        self.current_year = None
+        
         self.initial_balance = initial_balance
         self.trading_fee = trading_fee
-        self.max_steps = max_steps if max_steps else len(data) - 1
         
         # Definir espacios de acción y observación
         self.action_space = gym.spaces.Discrete(3)  # 0: Hold, 1: Buy, 2: Sell
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, 
-            shape=(7,), 
+            shape=(8,), 
             dtype=np.float32
         )
         
@@ -29,58 +31,168 @@ class TradingGymEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        
+        # Seleccionar año para el dataset
+        self.current_year = np.random.choice(self.years)
+        self.data = self.yearly_data[self.current_year]
+        
         self.current_step = 0
+        self.max_steps = len(self.data) - 1
         self.balance = self.initial_balance
         self.shares_held = 0
+        self.operations = []
         self.total_profit = 0
         self.trade_history = []
         self.port_val_history = [self.initial_balance]
         
         return self._get_observation(), {}
 
+    #def _get_observation(self):
+     #   return np.array([
+      #      self.data.iloc[self.current_step]['SMA_50'],
+       #     self.data.iloc[self.current_step]['SMA_200'],
+        #    self.data.iloc[self.current_step]['RSI_14'],
+         #   self.data.iloc[self.current_step]['MACD'],
+          #  self.shares_held,
+           # self.balance
+        #], dtype=np.float32)
+    
     def _get_observation(self):
+        row = self.data.iloc[self.current_step]
         return np.array([
-            self.data.loc[self.current_step, 'Close'],
-            self.data.loc[self.current_step, 'SMA_50'],
-            self.data.loc[self.current_step, 'SMA_200'],
-            self.data.loc[self.current_step, 'RSI_14'],
-            self.data.loc[self.current_step, 'MACD'],
+            row['SMA_50'],
+            row['SMA_200'],
+            row['RSI_14'],
+            row['MACD'],
+            row['BB_pct'],
+            row['ATR_norm'],
             self.shares_held,
             self.balance
         ], dtype=np.float32)
 
     def step(self, action):
-        # Incrementar el paso actual
         self.current_step += 1
         done = self.current_step >= self.max_steps
         truncated = False
-        
-        current_price = self.data.loc[self.current_step, 'Close']
+    
+        current_price = self.data.iloc[self.current_step]['Close']
         reward = 0
-
-        if action == 1:  # Comprar
+    
+        if action == 1:  # Buy
             if self.balance >= current_price:
                 fee = current_price * self.trading_fee
                 self.shares_held += 1
                 self.balance -= (current_price + fee)
-                reward = 0.01
-
-        elif action == 2:  # Vender
+                self.operations.append(current_price)
+    
+                # Premiar compras en RSI bajo (ej. sobreventa)
+                rsi = self.data.iloc[self.current_step]['RSI_14']
+                if rsi < 0.3:
+                    reward += 0.1
+                else:
+                    reward += -0.01  # castigo si compra caro
+    
+        elif action == 2:  # Sell
             if self.shares_held > 0:
                 fee = current_price * self.trading_fee
                 self.shares_held -= 1
                 self.balance += (current_price - fee)
-                reward = (current_price - current_price) / current_price  # Calcular rendimiento
-
-        # Calcular valor del portafolio
+                bought_at = self.operations.pop(0)
+                operation_return = (current_price / bought_at) - 1
+    
+                # Recompensa escalada y más agresiva
+                if operation_return >= 0.10:
+                    reward += 1.0
+                elif operation_return >= 0.05:
+                    reward += 0.5
+                elif operation_return >= 0.01:
+                    reward += 0.2
+                elif operation_return >= 0:
+                    reward += 0.05
+                elif operation_return > -0.05:
+                    reward -= 0.2
+                else:
+                    reward -= 0.5  # venta con gran pérdida
+    
+        elif action == 0:  # Hold
+            # Pequeña penalización si el precio cae
+            if self.current_step > 0:
+                prev_price = self.data.iloc[self.current_step - 1]['Close']
+                price_change = (current_price - prev_price) / prev_price
+                if price_change < 0:
+                    reward -= 0.01
+                else:
+                    reward += 0.005
+    
+        # Valor total del portafolio
         current_portfolio_value = self.balance + (self.shares_held * current_price)
+        change_portfolio = (current_portfolio_value - self.port_val_history[-1]) / self.port_val_history[-1]
+    
+        reward += 0.2 * change_portfolio  # más peso que antes
         self.port_val_history.append(current_portfolio_value)
-        
-        # Calcular recompensa basada en cambios de valor de portafolio
-        reward += (current_portfolio_value - self.port_val_history[-2]) / self.port_val_history[-2]
-
+    
         return self._get_observation(), reward, done, truncated, {}
-
+    
+    def calculate_performance_metrics(self):
+        """Calculate various trading performance metrics."""
+ 
+        portfolio_values = np.array(self.port_val_history)        
+        daily_returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        
+        # Calcular metricas
+        total_days = len(daily_returns)
+        trading_days_per_year = 252  # Standard assumption for trading days in a year
+        
+        # Rendimiento anualizado
+        total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
+        holding_period_years = total_days / trading_days_per_year
+        annualized_return = (1 + total_return) ** (1 / holding_period_years) - 1 if holding_period_years > 0 else 0
+        
+        # Radio de sharp (anualizado)
+        risk_free_rate = 0.02 / trading_days_per_year  # Assuming 2% annual risk-free rate
+        excess_returns = daily_returns - risk_free_rate
+        sharpe_ratio = (np.mean(excess_returns) * trading_days_per_year) / (np.std(daily_returns) * np.sqrt(trading_days_per_year)) if np.std(daily_returns) > 0 else 0
+        
+        # Sortino
+        downside_returns = daily_returns[daily_returns < 0]
+        downside_std = np.std(downside_returns) if len(downside_returns) > 0 else 0
+        sortino_ratio = (np.mean(excess_returns) * trading_days_per_year) / (downside_std * np.sqrt(trading_days_per_year)) if downside_std > 0 else 0
+        
+        # Max drawdown
+        peak = np.maximum.accumulate(portfolio_values)
+        drawdown = (peak - portfolio_values) / peak
+        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
+        
+        # Radio de Calmar (rendimiento anualizado / max drawdown)
+        calmar_ratio = annualized_return / max_drawdown if max_drawdown > 0 else 0
+        
+        # Relación de ganancia/perdida para trades
+        win_count = 0
+        loss_count = 0
+        
+        win_count = sum(1 for r in daily_returns if r > 0)
+        loss_count = sum(1 for r in daily_returns if r <= 0)
+        
+        win_loss_ratio = win_count / loss_count if loss_count > 0 else float('inf')
+        
+        # Ganancia total
+        total_profit = portfolio_values[-1] - portfolio_values[0]
+        
+        # Valor final del portafolio
+        final_portfolio_value = portfolio_values[-1]
+        
+        # Metrics dictionary
+        return {
+            'Sharpe_Ratio': sharpe_ratio,
+            'Sortino_Ratio': sortino_ratio,
+            'Calmar_Ratio': calmar_ratio,
+            'Max_Drawdown': max_drawdown,
+            'Win_Loss_Ratio': win_loss_ratio,
+            'Total_Profit': total_profit,
+            'Final_Portfolio_Value': final_portfolio_value,
+            'Annualized_Return': annualized_return
+        }
+    
 class TrainingCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -90,7 +202,7 @@ class TrainingCallback(BaseCallback):
         # Puedes agregar lógica de logging o tracking aquí
         return True
 
-def train_deep_q_learning(env, total_timesteps=50000):
+def train_deep_q_learning(env, total_timesteps=100000): # 10,000,000 - 50,000,000
     # Envolver el entorno en un DummyVecEnv
     vec_env = DummyVecEnv([lambda: env])
     
@@ -101,7 +213,7 @@ def train_deep_q_learning(env, total_timesteps=50000):
         verbose=1, 
         learning_rate=1e-3,
         buffer_size=10000,
-        learning_starts=1000,
+        learning_starts=500,
         batch_size=64,
         tau=0.005,
         gamma=0.99,
@@ -119,9 +231,145 @@ def train_deep_q_learning(env, total_timesteps=50000):
     
     return model
 
-def evaluate_model(model, env, num_episodes=10):
-    # Evaluar el rendimiento del modelo
-    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=num_episodes)
-    print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
+# =============================================================================
+# def train_ppo(env, valid_env, total_timesteps=100_000):
+#     vec_env = DummyVecEnv([lambda: env])
+#     eval_env = DummyVecEnv([lambda: valid_env])
+# 
+#     model = PPO(
+#         "MlpPolicy",
+#         vec_env,
+#         verbose=1,
+#         learning_rate=3e-4,
+#         n_steps=2048,
+#         batch_size=64,
+#         n_epochs=10,
+#         gamma=0.99,
+#         gae_lambda=0.95,
+#         clip_range=0.2,
+#         ent_coef=0.01
+#     )
+# 
+#     eval_callback = EvalCallback(
+#         eval_env,
+#         best_model_save_path='./best_model/',
+#         log_path='./logs/',
+#         eval_freq=5000,  # cada 5000 pasos
+#         deterministic=True,
+#         render=False
+#     )
+# 
+#     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
+# 
+#     return model
+# =============================================================================
+
+def train_ppo(env, valid_env, total_timesteps=500_000):
+    vec_env = DummyVecEnv([lambda: env])
+    eval_env = DummyVecEnv([lambda: valid_env])
+
+    # Stop si no mejora por 5 evaluaciones consecutivas
+    stop_callback = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=5,
+        min_evals=5,
+        verbose=1
+    )
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path='./best_model/',
+        log_path='./logs/',
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+        callback_after_eval=stop_callback
+    )
+
+    model = PPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01
+    )
+
+    model.learn(total_timesteps=total_timesteps, callback=eval_callback)
+    return model
+
+def evaluate_model(model, env, num_episodes=10, seed=None):
+    """
+    Custom evaluation function for trading models that calculates more reliable statistics.
+    """
     
-    return mean_reward, std_reward
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Lista para guardar resultados
+    episode_rewards = []
+    episode_returns = []
+    episode_lengths = []
+    action_counts = {0: 0, 1: 0, 2: 0}  # Hold, Buy, Sell
+    
+    # Correr episodios de evaluación
+    for i in range(num_episodes):
+        # Resetear ambiente con una seed diferente cada vez
+        episode_seed = None if seed is None else seed + i
+        obs, _ = env.reset(seed=episode_seed)
+        
+        done = False
+        truncated = False
+        total_reward = 0
+        step_count = 0
+        initial_value = env.port_val_history[0]
+        
+        # Correr episodio de evaluación
+        while not (done or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            
+            action_int = action.item() if hasattr(action, 'item') else int(action)
+            action_counts[action_int] += 1
+            
+            obs, reward, done, truncated, _ = env.step(action)
+            total_reward += reward
+            step_count += 1
+        
+        # Valor final del portafolio y rendimientos
+        final_value = env.port_val_history[-1]
+        episode_return = (final_value / initial_value) - 1
+        
+        episode_rewards.append(total_reward)
+        episode_returns.append(episode_return)
+        episode_lengths.append(step_count)
+        
+        print(f"Episode {i+1}/{num_episodes}: Reward={total_reward:.2f}, Return={episode_return*100:.2f}%, Length={step_count}")
+    
+    # Metricas
+    mean_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    mean_return = np.mean(episode_returns)
+    std_return = np.std(episode_returns)
+    
+    total_actions = sum(action_counts.values())
+    action_distribution = {
+        'Hold': action_counts[0] / total_actions if total_actions > 0 else 0,
+        'Buy': action_counts[1] / total_actions if total_actions > 0 else 0,
+        'Sell': action_counts[2] / total_actions if total_actions > 0 else 0
+    }
+    
+    # Diccionario con metricas
+    return {
+        'mean_reward': mean_reward,
+        'std_reward': std_reward,
+        'mean_return': mean_return,
+        'std_return': std_return,
+        'min_reward': np.min(episode_rewards),
+        'max_reward': np.max(episode_rewards),
+        'action_distribution': action_distribution,
+        'episode_lengths': np.mean(episode_lengths)
+    }
