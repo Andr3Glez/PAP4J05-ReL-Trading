@@ -3,50 +3,15 @@ import numpy as np
 from deepQLearning import TradingGymEnv, train_deep_q_learning, train_ppo, evaluate_model
 import matplotlib.pyplot as plt
 from data_base import download_and_prepare_data_by_years
+import os
+from stable_baselines3 import PPO
 
 def load_market_data_by_years(ticker="AAPL", start_date="2010-01-01", end_date="2024-01-01"):
-    
     # Descargar y preparar los datos del mercado, divididos por año
     yearly_data, full_data = download_and_prepare_data_by_years(ticker, start_date, end_date)
-    
     return yearly_data, full_data
 
-# =============================================================================
-# def plot_performance(model, env, full_data):
-#     # Crear un ambiente de prueba separado usando el dataset completo
-#     test_env = TradingGymEnv({0: full_data}, initial_balance=env.initial_balance, trading_fee=env.trading_fee)
-# 
-#     # Simular episodio con el modelo entrenado
-#     obs, _ = test_env.reset()
-#     done = False
-#     truncated = False
-#     total_reward = 0
-#     portfolio_values = [test_env.initial_balance]
-# 
-#     while not (done or truncated):
-#         action, _ = model.predict(obs)
-#         obs, reward, done, truncated, _ = test_env.step(action)
-#         total_reward += reward
-#         portfolio_values.append(test_env.balance + (test_env.shares_held * test_env.data.iloc[test_env.current_step]['Close']))
-# 
-#     # Graficar valor del portafolio
-#     plt.figure(figsize=(10, 6))
-#     plt.plot(portfolio_values)
-#     plt.title('Valor del Portafolio Durante Simulación')
-#     plt.xlabel('Pasos')
-#     plt.ylabel('Valor del Portafolio')
-#     plt.tight_layout()
-#     plt.savefig('portfolio_performance.png')
-#     plt.close()
-#     
-#     # After plotting, calculate and print performance metrics
-#     metrics = test_env.calculate_performance_metrics()
-#     
-#     return total_reward, portfolio_values, metrics
-# =============================================================================
-
 def plot_performance(model, env, full_data):
-
     # Crear un ambiente de prueba separado usando el dataset completo
     test_env = TradingGymEnv({0: full_data}, initial_balance=env.initial_balance, trading_fee=env.trading_fee)
 
@@ -55,7 +20,6 @@ def plot_performance(model, env, full_data):
     done = False
     truncated = False
     total_reward = 0
-
     portfolio_values = [test_env.initial_balance]
     actions_taken = []
     prices = []
@@ -97,12 +61,27 @@ def plot_performance(model, env, full_data):
     plt.legend()
     plt.tight_layout()
     plt.savefig('acciones_agente.png')
-    plt.close()
+    plt.close() 
 
     # Calcular métricas de performance
     metrics = test_env.calculate_performance_metrics()
-
     return total_reward, portfolio_values, metrics
+
+def compute_buy_and_hold(full_data, initial_balance=10000):
+    first_price = full_data.iloc[0]['Close']
+    last_price = full_data.iloc[-1]['Close']
+    
+    shares_bought = initial_balance / first_price
+    final_value = shares_bought * last_price
+    
+    total_return = (final_value / initial_balance) - 1
+    annualized_return = (1 + total_return) ** (1 / ((len(full_data) / 252))) - 1
+
+    return {
+        'BuyHold_Final_Value': final_value,
+        'BuyHold_Total_Profit': final_value - initial_balance,
+        'BuyHold_Annualized_Return': annualized_return
+    }
 
 
 def main():
@@ -116,17 +95,18 @@ def main():
     env = TradingGymEnv(train_data)
     valid_env = TradingGymEnv(valid_data, initial_balance=env.initial_balance, trading_fee=env.trading_fee)
 
-    # Entrenar modelo Deep Q-Learning
-    #model = train_deep_q_learning(env)
-    #model = train_ppo(env, total_timesteps=100_000)
-    model = train_ppo(env, valid_env, total_timesteps=500_000)
+    # Configurar el directorio de logs para TensorBoard
+    log_dir = "logs/ppo_tensorboard/"
+    os.makedirs(log_dir, exist_ok=True)
 
+    # Entrenar modelo PPO con soporte de TensorBoard
+    model = PPO("MlpPolicy", env, verbose=1, tensorboard_log=log_dir)
+    model.learn(total_timesteps=500_000, log_interval=10)
 
-    # Guardar modelo
-    model.save("trading_dqn_model")
+    # Guardar el modelo entrenado
+    model.save("trading_ppo_model")
 
     # Evaluar modelo
-    
     eval_metrics = evaluate_model(model, env, num_episodes=50)
 
     # Resultados de la evaluación
@@ -136,7 +116,6 @@ def main():
     print(f"Action Distribution: Hold={eval_metrics['action_distribution']['Hold']*100:.1f}%, " + 
         f"Buy={eval_metrics['action_distribution']['Buy']*100:.1f}%, " +
       f"Sell={eval_metrics['action_distribution']['Sell']*100:.1f}%")
-
 
     # Simular rendimiento
     total_reward, portfolio_values, metrics = plot_performance(model, env, full_data)
@@ -152,6 +131,14 @@ def main():
     print(f"Annualized Return: {metrics['Annualized_Return']*100:.2f}%")
     print(f"Total Profit: ${metrics['Total_Profit']:.2f}")
     print(f"Final Portfolio Value: ${metrics['Final_Portfolio_Value']:.2f}")
+
+    # Comparar contra Buy & Hold
+    buy_hold_results = compute_buy_and_hold(full_data)
+    
+    print("\nBuy & Hold Benchmark:")
+    print(f"Final Value: ${buy_hold_results['BuyHold_Final_Value']:.2f}")
+    print(f"Total Profit: ${buy_hold_results['BuyHold_Total_Profit']:.2f}")
+    print(f"Annualized Return: {buy_hold_results['BuyHold_Annualized_Return']*100:.2f}%")
 
     # Guardar métricas en archivo CSV
     metrics_df = pd.DataFrame({

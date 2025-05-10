@@ -1,13 +1,16 @@
 import gymnasium as gym
+import os
 import numpy as np
 import pandas as pd
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, StopTrainingOnNoModelImprovement
+from torch.utils.tensorboard import SummaryWriter
+
 
 class TradingGymEnv(gym.Env):
-    def __init__(self, yearly_data, initial_balance=10000, trading_fee=0.001):
+    def __init__(self, yearly_data, initial_balance=1000000, trading_fee=0.4):
         super().__init__()
         
         # Configuración del entorno
@@ -202,6 +205,23 @@ class TrainingCallback(BaseCallback):
         # Puedes agregar lógica de logging o tracking aquí
         return True
 
+class TensorboardMetricsCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.writer = None
+
+    def _on_training_start(self):
+        log_dir = os.path.join(self.logger.dir, "custom_metrics")
+        self.writer = SummaryWriter(log_dir)
+
+    def _on_step(self) -> bool:
+        env = self.training_env.envs[0]
+        if hasattr(env, "port_val_history") and len(env.port_val_history) > 1:
+            port_value = env.port_val_history[-1]
+            self.writer.add_scalar("custom/portfolio_value", port_value, self.num_timesteps)
+        return True
+
+
 def train_deep_q_learning(env, total_timesteps=100000): # 10,000,000 - 50,000,000
     # Envolver el entorno en un DummyVecEnv
     vec_env = DummyVecEnv([lambda: env])
@@ -264,7 +284,7 @@ def train_deep_q_learning(env, total_timesteps=100000): # 10,000,000 - 50,000,00
 #     return model
 # =============================================================================
 
-def train_ppo(env, valid_env, total_timesteps=500_000):
+def train_ppo(env, valid_env, total_timesteps=50_000_000):
     vec_env = DummyVecEnv([lambda: env])
     eval_env = DummyVecEnv([lambda: valid_env])
 
@@ -285,10 +305,13 @@ def train_ppo(env, valid_env, total_timesteps=500_000):
         callback_after_eval=stop_callback
     )
 
+    log_dir = './logs/ppo_tensorboard/'
+
     model = PPO(
         "MlpPolicy",
         vec_env,
         verbose=1,
+        tensorboard_log=log_dir,
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=64,
@@ -299,7 +322,9 @@ def train_ppo(env, valid_env, total_timesteps=500_000):
         ent_coef=0.01
     )
 
-    model.learn(total_timesteps=total_timesteps, callback=eval_callback)
+    combined_callback = [eval_callback, TensorboardMetricsCallback()]
+    model.learn(total_timesteps=total_timesteps, callback=combined_callback)
+
     return model
 
 def evaluate_model(model, env, num_episodes=10, seed=None):
